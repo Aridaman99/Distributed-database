@@ -1,0 +1,192 @@
+P2P Storage Client Node Implementation
+
+// File: pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <groupId>com.p2pstorage</groupId>
+    <artifactId>p2p-storage-client</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+    </parent>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>31.1-jre</version>
+        </dependency>
+        <dependency>
+            <groupId>commons-codec</groupId>
+            <artifactId>commons-codec</artifactId>
+            <version>1.15</version>
+        </dependency>
+    </dependencies>
+</project>
+
+// File: src/main/java/com/p2pstorage/model/FileChunk.java
+package com.p2pstorage.model;
+
+public class FileChunk {
+    private String chunkId;
+    private byte[] data;
+    private int sequence;
+    private String fileId;
+    private long timestamp;
+    
+    // Getters, setters, and constructors
+}
+
+// File: src/main/java/com/p2pstorage/service/ChunkManager.java
+package com.p2pstorage.service;
+
+import com.p2pstorage.model.FileChunk;
+import org.springframework.stereotype.Service;
+import com.google.common.hash.Hashing;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.io.*;
+
+@Service
+public class ChunkManager {
+    private static final int CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+    
+    public List<FileChunk> splitFile(File file) throws IOException {
+        List<FileChunk> chunks = new ArrayList<>();
+        String fileId = generateFileId(file);
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] buffer = new byte[CHUNK_SIZE];
+            int sequence = 0;
+            int bytesRead;
+            
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                byte[] chunkData;
+                if (bytesRead == CHUNK_SIZE) {
+                    chunkData = buffer.clone();
+                } else {
+                    chunkData = Arrays.copyOf(buffer, bytesRead);
+                }
+                
+                FileChunk chunk = new FileChunk();
+                chunk.setChunkId(generateChunkId(fileId, sequence));
+                chunk.setData(chunkData);
+                chunk.setSequence(sequence);
+                chunk.setFileId(fileId);
+                chunk.setTimestamp(System.currentTimeMillis());
+                
+                chunks.add(chunk);
+                sequence++;
+            }
+        }
+        return chunks;
+    }
+    
+    private String generateFileId(File file) {
+        return Hashing.sha256()
+            .hashString(file.getName() + file.length() + file.lastModified(), 
+                       StandardCharsets.UTF_8)
+            .toString();
+    }
+    
+    private String generateChunkId(String fileId, int sequence) {
+        return Hashing.sha256()
+            .hashString(fileId + sequence, StandardCharsets.UTF_8)
+            .toString();
+    }
+}
+
+// File: src/main/java/com/p2pstorage/service/LocalCache.java
+package com.p2pstorage.service;
+
+import com.p2pstorage.model.FileChunk;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Service
+public class LocalCache {
+    private final ConcurrentHashMap<String, FileChunk> chunkCache = new ConcurrentHashMap<>();
+    
+    public void storeChunk(FileChunk chunk) {
+        chunkCache.put(chunk.getChunkId(), chunk);
+    }
+    
+    public FileChunk getChunk(String chunkId) {
+        return chunkCache.get(chunkId);
+    }
+    
+    public boolean hasChunk(String chunkId) {
+        return chunkCache.containsKey(chunkId);
+    }
+}
+
+// File: src/main/java/com/p2pstorage/service/PeerService.java
+package com.p2pstorage.service;
+
+import org.springframework.stereotype.Service;
+import org.springframework.web.socket.WebSocketSession;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Set;
+
+@Service
+public class PeerService {
+    private final ConcurrentHashMap<String, WebSocketSession> activePeers = new ConcurrentHashMap<>();
+    
+    public void registerPeer(String peerId, WebSocketSession session) {
+        activePeers.put(peerId, session);
+    }
+    
+    public void removePeer(String peerId) {
+        activePeers.remove(peerId);
+    }
+    
+    public Set<String> getActivePeers() {
+        return activePeers.keySet();
+    }
+}
+
+// File: src/main/java/com/p2pstorage/controller/FileController.java
+package com.p2pstorage.controller;
+
+import com.p2pstorage.service.ChunkManager;
+import com.p2pstorage.model.FileChunk;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import java.io.File;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/files")
+public class FileController {
+    private final ChunkManager chunkManager;
+    
+    public FileController(ChunkManager chunkManager) {
+        this.chunkManager = chunkManager;
+    }
+    
+    @PostMapping("/upload")
+    public List<String> uploadFile(@RequestParam("file") MultipartFile file) throws Exception {
+        File tempFile = File.createTempFile("upload_", "_temp");
+        file.transferTo(tempFile);
+        
+        List<FileChunk> chunks = chunkManager.splitFile(tempFile);
+        tempFile.delete();
+        
+        return chunks.stream()
+            .map(FileChunk::getChunkId)
+            .toList();
+    }
+}
